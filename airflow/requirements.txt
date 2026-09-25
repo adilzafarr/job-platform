@@ -1,0 +1,4 @@
+# Runtime dependencies added on top of the apache/airflow image.
+# requests, boto3 and pyarrow already ship with the image (pinned by its constraints).
+duckdb==1.5.5
+defusedxml==0.7.1

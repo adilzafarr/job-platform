@@ -1,0 +1,197 @@
+# Local development stack for the ingestion phase:
+#   Airflow 3 (api-server, scheduler, dag-processor; LocalExecutor) + Postgres (Airflow metadata)
+#   MinIO (the lake: Bronze data, ingestion state and metrics)
+#
+#   docker compose up -d --build        # start (first run builds the Airflow image)
+#   Airflow UI  http://localhost:8080   # credentials: _AIRFLOW_WWW_USER_* (default airflow / airflow)
+#   MinIO UI    http://localhost:9001   # credentials: MINIO_ROOT_USER / MINIO_ROOT_PASSWORD
+#
+# Copy .env.example to .env to override defaults. See docs/ingestion/README.md.
+
+x-airflow-common: &airflow-common
+  build:
+    context: ./airflow
+    target: runtime
+  image: job-platform-airflow:local
+  env_file:
+    - path: .env
+      required: false
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET:-local-dev-jwt-secret-change-me}
+    AIRFLOW__API_AUTH__JWT_ISSUER: job-platform
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "60"
+    PYTHONPATH: /opt/airflow
+    # --- lake (MinIO locally; for AWS S3 unset the endpoint and use IAM credentials)
+    LAKE_STORAGE_BACKEND: s3
+    LAKE_BUCKET: ${LAKE_BUCKET:-job-platform-lake}
+    LAKE_S3_ENDPOINT_URL: http://minio:9000
+    LAKE_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+    LAKE_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin-local}
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/include:/opt/airflow/include
+    - ./airflow/plugins:/opt/airflow/plugins
+    - airflow-logs:/opt/airflow/logs
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+    minio-init:
+      condition: service_completed_successfully
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  minio:
+    # The upstream minio/minio images are no longer published; this image is
+    # built from MinIO source by Chainguard. Override with MINIO_IMAGE if needed.
+    image: ${MINIO_IMAGE:-chainguard/minio:latest}
+    command: ["server", "/data", "--console-address", ":9001"]
+    # Run as root so the fresh named volume is writable (local dev only).
+    user: "0:0"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin-local}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      # The image has bash but no curl/wget/grep: speak HTTP over /dev/tcp.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /minio/health/live HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ $$status == *' 200 '* ]]"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  minio-init:
+    image: ${MINIO_IMAGE:-chainguard/minio:latest}
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MC_CONFIG_DIR: /tmp/.mc
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin-local}
+      LAKE_BUCKET: ${LAKE_BUCKET:-job-platform-lake}
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        set -e
+        mc alias set lake http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null
+        mc mb --ignore-existing "lake/$$LAKE_BUCKET"
+        echo "Bucket $$LAKE_BUCKET ready"
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /opt/airflow/logs
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/logs
+        /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+    user: "0:0"
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Unit tests + DAG import test. No network access to providers is needed.
+  #   docker compose --profile test run --rm airflow-tests
+  airflow-tests:
+    build:
+      context: ./airflow
+      target: test
+    image: job-platform-airflow:test
+    profiles: ["test"]
+    working_dir: /opt/airflow
+    environment:
+      PYTHONPATH: /opt/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      LAKE_STORAGE_BACKEND: local
+      RUN_LIVE_TESTS: ${RUN_LIVE_TESTS:-0}
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/include:/opt/airflow/include
+      - ./airflow/tests:/opt/airflow/tests
+      - ./airflow/pytest.ini:/opt/airflow/pytest.ini
+    entrypoint: ["python", "-m", "pytest"]
+    command: ["-q"]
+
+volumes:
+  postgres-data:
+  minio-data:
+  airflow-logs:
